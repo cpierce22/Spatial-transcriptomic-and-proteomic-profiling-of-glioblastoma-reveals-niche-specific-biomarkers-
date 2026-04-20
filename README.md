@@ -1,12 +1,2 @@
-# Spatial-transcriptomic-and-proteomic-profiling-of-glioblastoma-reveals-niche-specific-biomarkers-\
-# Glioblastoma (GBM) is the most common central nervous system malignancy, comprising up to 50% of all malignant gliomas.
-# It is also the most aggressive, with a median survival of only 15 months, despite maximal safe surgical resection, radiotherapy,
-# and temozolomide treatment. Given its prevalence, recurrence rate, and lethality, it is vital to identify biomarkers to predict 
-# patient prognosis and improve outcomes. We utilized Digital Spatial Profiling (DSP) via the NanoString GeoMx® platform to 
-# characterize the spatial proteomic and transcriptomic landscape of 19 IDH-wildtype GBM tumors. High-resolution expression data
-# from 566 proteins and 17,466 mRNAs were analyzed using unsupervised clustering, differential expression analysis, and pathway 
-# enrichment techniques. Tumor regions clustered most distinctly by spatial niche rather than by other demographic and clinical 
-# features such as sex, age, or tumor location within the brain. Our findings describe a heterogeneous but spatially coordinated
-# network of survival, immune suppression, and regeneration mechanisms. Overall, we provide a framework for the spatial profiling
-# of GBM being used for patient-specific treatment design and prognosis predictions.
+Glioblastoma (GBM) is the most common central nervous system malignancy, comprising up to 50% of all malignant gliomas. It is also the most aggressive, with a median survival of only 15 months, despite maximal safe surgical resection, radiotherapy, and temozolomide treatment. Given its prevalence, recurrence rate, and lethality, it is vital to identify biomarkers to predict patient prognosis and improve outcomes. We utilized Digital Spatial Profiling (DSP) via the NanoString GeoMx® platform to characterize the spatial proteomic and transcriptomic landscape of 19 IDH-wildtype GBM tumors. High-resolution expression data from 566 proteins and 17,466 mRNAs were analyzed using unsupervised clustering, differential expression analysis, and pathway enrichment techniques. Tumor regions clustered most distinctly by spatial niche rather than by other demographic and clinical features such as sex, age, or tumor location within the brain. Our findings describe a heterogeneous but spatially coordinated network of survival, immune suppression, and regeneration mechanisms. Overall, we provide a framework for the spatial profiling of GBM being used for patient-specific treatment design and prognosis predictions.
 
