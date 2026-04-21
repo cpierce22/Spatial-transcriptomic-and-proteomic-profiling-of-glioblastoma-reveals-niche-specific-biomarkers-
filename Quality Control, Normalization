@@ -1,0 +1,256 @@
+# =============================================================================
+# GeoMx DSP QC Workflow
+# =============================================================================
+
+# ----------------------------- #
+# 1. Setup & Package Loading
+# ----------------------------- #
+
+required_pkgs <- c(
+  "tidyverse", "NanoStringNCTools", "GeomxTools",
+  "GeoMxWorkflows", "openxlsx", "knitr", "scales",
+  "reshape2", "cowplot", "umap", "Rtsne", "pheatmap"
+)
+
+# Install missing packages
+installed <- rownames(installed.packages())
+for (pkg in setdiff(required_pkgs, installed)) {
+  install.packages(pkg)
+}
+
+# Load libraries
+lapply(required_pkgs, library, character.only = TRUE)
+
+# Bioconductor setup (run once if needed)
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+# ----------------------------- #
+# 2. Version Compatibility Check
+# ----------------------------- #
+
+if (packageVersion("GeomxTools") < "2.1" &&
+    packageVersion("GeoMxWorkflows") >= "1.0.1") {
+  stop("GeomxTools and GeoMxWorkflows versions are incompatible.")
+}
+
+if (packageVersion("GeomxTools") > "2.1" &&
+    packageVersion("GeoMxWorkflows") <= "1.0.1") {
+  stop("GeomxTools and GeoMxWorkflows versions are incompatible.")
+}
+
+# ----------------------------- #
+# 3. File Paths & Input Data
+# ----------------------------- #
+
+data_dir <- "/path/to/data"
+
+dcc_files <- list.files(
+  file.path(data_dir, "DCC"),
+  pattern = "\\.dcc$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+pkc_files <- list.files(
+  file.path(data_dir, "PKC"),
+  pattern = "\\.pkc$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+annotation_file <- file.path(data_dir, "annotation.xlsx")
+
+# Remove known bad file
+dcc_files <- dcc_files[!basename(dcc_files) %in%
+                         "DSP-1001660011697-F-A01.dcc"]
+
+# ----------------------------- #
+# 4. Load GeoMx Dataset
+# ----------------------------- #
+
+geo_data <- suppressWarnings(
+  readNanoStringGeoMxSet(
+    dccFiles = dcc_files,
+    pkcFiles = pkc_files,
+    phenoDataFile = annotation_file,
+    phenoDataSheet = "Updated_Annotations for DSP",
+    phenoDataDccColName = "Sample_ID",
+    protocolDataColNames = c("ROI_ID", "Cores")
+  )
+)
+
+# ----------------------------- #
+# 5. QC: Segment-Level Filtering
+# ----------------------------- #
+
+geo_data <- shiftCountsOne(geo_data, useDALogic = TRUE)
+
+qc_params <- list(
+  minSegmentReads = 1000,
+  percentTrimmed = 80,
+  percentStitched = 80,
+  percentAligned = 75,
+  percentSaturation = 50,
+  minNegativeCount = 1,
+  maxNTCCount = 9000,
+  minNuclei = 20,
+  minArea = 1000
+)
+
+geo_data <- setSegmentQCFlags(geo_data, qcCutoffs = qc_params)
+
+# QC summary
+qc_flags <- protocolData(geo_data)[["QCFlags"]]
+
+qc_summary <- data.frame(
+  Pass = colSums(!qc_flags),
+  Warning = colSums(qc_flags)
+)
+
+qc_flags$QCStatus <- ifelse(rowSums(qc_flags) == 0, "PASS", "WARNING")
+
+qc_summary["TOTAL", ] <- c(
+  sum(qc_flags$QCStatus == "PASS"),
+  sum(qc_flags$QCStatus == "WARNING")
+)
+
+# ----------------------------- #
+# 6. Aggregate Counts
+# ----------------------------- #
+
+target_data <- aggregateCounts(geo_data)
+
+# ----------------------------- #
+# 7. Limit of Quantification (LOQ)
+# ----------------------------- #
+
+modules <- gsub(".pkc", "", annotation(geo_data))
+min_loq <- 2
+cutoff <- 2
+
+loq_df <- data.frame(row.names = colnames(target_data))
+
+for (mod in modules) {
+  vars <- paste0(c("NegGeoMean_", "NegGeoSD_"), mod)
+
+  if (all(vars %in% colnames(pData(target_data)))) {
+    loq_df[, mod] <- pmax(
+      min_loq,
+      pData(target_data)[, vars[1]] *
+        (pData(target_data)[, vars[2]] ^ cutoff)
+    )
+  }
+}
+
+pData(target_data)$LOQ <- loq_df
+
+# ----------------------------- #
+# 8. Gene Detection Metrics
+# ----------------------------- #
+
+loq_mat <- do.call(rbind, lapply(modules, function(mod) {
+  idx <- fData(target_data)$Module == mod
+  t(esApply(target_data[idx, ], 1, function(x) x > loq_df[, mod]))
+}))
+
+loq_mat <- loq_mat[fData(target_data)$TargetName, ]
+
+pData(target_data)$GenesDetected <- colSums(loq_mat, na.rm = TRUE)
+pData(target_data)$GeneDetectionRate <-
+  pData(target_data)$GenesDetected / nrow(target_data)
+
+# Filter segments
+target_data <- target_data[, pData(target_data)$GeneDetectionRate >= 0.1]
+
+# ----------------------------- #
+# 9. Gene-Level Filtering
+# ----------------------------- #
+
+fData(target_data)$DetectedSegments <- rowSums(loq_mat, na.rm = TRUE)
+fData(target_data)$DetectionRate <-
+  fData(target_data)$DetectedSegments / nrow(pData(target_data))
+
+neg_probes <- unique(
+  subset(fData(target_data), CodeClass == "Negative")$TargetName
+)
+
+target_data <- target_data[
+  fData(target_data)$DetectionRate >= 0.1 |
+    fData(target_data)$TargetName %in% neg_probes,
+]
+
+# ----------------------------- #
+# 10. Normalization
+# ----------------------------- #
+
+target_data <- normalize(
+  target_data,
+  norm_method = "quant",
+  desiredQuantile = 0.75,
+  toElt = "q_norm"
+)
+
+target_data <- normalize(
+  target_data,
+  norm_method = "neg",
+  fromElt = "exprs",
+  toElt = "neg_norm"
+)
+
+# ----------------------------- #
+# 11. Dimensionality Reduction
+# ----------------------------- #
+
+set.seed(42)
+
+# UMAP
+umap_config <- umap::umap.defaults
+umap_config$random_state <- 42
+
+umap_res <- umap(
+  t(log2(assayDataElement(target_data, "q_norm"))),
+  config = umap_config
+)
+
+pData(target_data)[, c("UMAP1", "UMAP2")] <- umap_res$layout
+
+# t-SNE
+tsne_res <- Rtsne(
+  t(log2(assayDataElement(target_data, "q_norm"))),
+  perplexity = ncol(target_data) * 0.15
+)
+
+pData(target_data)[, c("tSNE1", "tSNE2")] <- tsne_res$Y
+
+# ----------------------------- #
+# 12. Variability (CV)
+# ----------------------------- #
+
+assayDataElement(target_data, "log_q") <-
+  assayDataApply(target_data, 2, log2, elt = "q_norm")
+
+calc_cv <- function(x) sd(x) / mean(x)
+
+cv_values <- assayDataApply(target_data, 1, calc_cv, elt = "log_q")
+
+top_variable_genes <- sort(cv_values, decreasing = TRUE)[1:5]
+
+# ----------------------------- #
+# 13. Metadata Processing
+# ----------------------------- #
+
+pData(target_data)$Age <- as.numeric(pData(target_data)$Age)
+
+pData(target_data)$AgeGroup <- cut(
+  pData(target_data)$Age,
+  breaks = c(50, 60, 70, 80, Inf),
+  labels = c("50-60", "60-70", "70-80", "80+"),
+  right = FALSE,
+  include.lowest = TRUE
+)
+
+# =============================================================================
+# End of Workflow
+# =============================================================================
