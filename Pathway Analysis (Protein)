@@ -1,0 +1,287 @@
+library(tidyverse)
+
+# Step 1: Load the data
+df <- read.csv("CellularTumor57.csv", stringsAsFactors = FALSE)
+
+# Step 2: Clean and split the Pathways column
+df$Pathways <- trimws(df$Pathways)
+df <- df[!is.na(df$Pathways) & df$Pathways != "", ]
+
+# Step 3: Expand multiple pathways into separate rows
+df_expanded <- df %>%
+  separate_rows(Pathways, sep = ";") %>%
+  mutate(Pathways = trimws(Pathways)) %>%
+  filter(Pathways != "")
+
+# Step 4: Calculate average logFC per pathway
+pathway_summary <- df_expanded %>%
+  group_by(Pathways) %>%
+  summarise(mean_logFC = mean(logFC, na.rm = TRUE)) %>%
+  ungroup()
+
+# Step 5: Get top 5 upregulated and downregulated pathways
+top_up <- pathway_summary %>%
+  arrange(desc(mean_logFC)) %>%
+  slice_head(n = 5) %>%
+  mutate(Direction = "Up-regulated")
+
+top_down <- pathway_summary %>%
+  arrange(mean_logFC) %>%
+  slice_head(n = 5) %>%
+  mutate(Direction = "Down-regulated")
+
+# Step 6: Combine and plot
+bar_data <- bind_rows(top_up, top_down)
+
+ggplot(bar_data, aes(x = reorder(Pathways, mean_logFC), y = mean_logFC, fill = Direction)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("Up-regulated" = "red", "Down-regulated" = "blue")) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Top Up- and Down-Regulated Pathways in Cellular Tumor",
+    x = NULL,
+    y = "Average Log₂(Fold Change)"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+# ============================================================
+# DSP Proteomics: limma DE + Target-group membership plots
+# Nicer formatting + prettier PDFs
+# Outputs: 3 PDFs to ~/Desktop
+# ============================================================
+
+# --------------------
+# 0) Packages
+# --------------------
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+
+cran_pkgs <- c("dplyr","tidyr","ggplot2","stringr","readxl")
+for (p in cran_pkgs) if (!requireNamespace(p, quietly=TRUE)) install.packages(p)
+
+bioc_pkgs <- c("NanoStringNCTools","GeomxTools","GeoMxWorkflows","limma")
+for (p in bioc_pkgs) if (!requireNamespace(p, quietly=TRUE)) BiocManager::install(p, ask=FALSE)
+
+library(NanoStringNCTools)
+library(GeomxTools)
+library(GeoMxWorkflows)
+library(limma)
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+
+# --------------------
+# 1) Paths + files
+# --------------------
+datadir <- "/Users/sachibadola/Desktop/DSP/Gaur Lab/DSP_Proteomic"
+SampleAnnotationFile <- file.path(datadir, "Dataset.xlsx")
+
+DCCFiles <- dir(datadir, pattern="\\.[dD][cC][cC]$", full.names=TRUE, recursive=TRUE)
+PKCFiles <- dir(datadir, pattern="\\.[pP][kK][cC]$", full.names=TRUE, recursive=TRUE)
+
+exclude_dcc <- c(
+  "DSP-1001660011697-F-E07.dcc","DSP-1001660011697-F-E08.dcc","DSP-1001660011697-F-E09.dcc",
+  "DSP-1001660011697-F-E10.dcc","DSP-1001660011697-F-H02.dcc","DSP-1001660011697-F-A01.dcc"
+)
+DCCFiles <- DCCFiles[!tolower(basename(DCCFiles)) %in% tolower(exclude_dcc)]
+
+stopifnot(length(DCCFiles) > 0, length(PKCFiles) > 0)
+cat(" Inputs loaded | DCC:", length(DCCFiles), " PKC:", length(PKCFiles), "\n")
+
+# --------------------
+# 2) Load GeoMxSet (Protein)
+# --------------------
+proteinData <- suppressWarnings(readNanoStringGeoMxSet(
+  dccFiles = DCCFiles,
+  pkcFiles = PKCFiles,
+  phenoDataFile = SampleAnnotationFile,
+  phenoDataSheet = "Updated_Annotations for DSP",
+  phenoDataDccColName = "Sample_ID",
+  analyte = "Protein"
+))
+stopifnot(ncol(proteinData) > 0)
+cat("🔎 proteinData dim (features x samples):", dim(proteinData), "\n")
+
+# --------------------
+# 3) QC + normalize + log2
+# --------------------
+proteinData <- setSegmentQCFlags(proteinData, qcCutoffs=list(
+  percentSaturation = 45,
+  minSegmentReads   = 1000,
+  percentAligned    = 80,
+  minNegativeCount  = 10,
+  maxNTCCount       = 60,
+  minNuclei         = 16000,
+  minArea           = 20
+))
+
+proteinData <- normalize(proteinData, norm_method="quant", desiredQuantile=0.75, toElt="q_norm")
+assayDataElement(proteinData, "log2_q") <- log2(assayDataElement(proteinData, "q_norm") + 1)
+
+qc_flags <- as.data.frame(protocolData(proteinData)[["QCFlags"]])
+if ("LowSaturation" %in% colnames(qc_flags)) {
+  lowSaturation <- which(qc_flags$LowSaturation == TRUE)
+  if (length(lowSaturation) > 0) proteinData <- proteinData[, -lowSaturation]
+}
+
+expr_matrix <- assayDataElement(proteinData, "log2_q")
+
+# --------------------
+# 4) Sample metadata + niche relabel
+# --------------------
+sample_info <- as.data.frame(pData(proteinData))
+rownames(sample_info) <- sampleNames(proteinData)
+
+seg_col <- if ("Segment Tags" %in% colnames(sample_info)) "Segment Tags" else "Segment"
+sample_info$Segment <- trimws(as.character(sample_info[[seg_col]]))
+sample_info$Segment[sample_info$Segment == "Necrosis"] <- "Perinecrotic"
+sample_info$Segment[sample_info$Segment == "Vessel"]   <- "Perivascular"
+sample_info$Segment <- droplevels(factor(sample_info$Segment))
+
+cat("Segment counts:\n")
+print(table(sample_info$Segment, useNA="ifany"))
+
+sample_info <- sample_info[colnames(expr_matrix), , drop = FALSE]
+stopifnot(identical(rownames(sample_info), colnames(expr_matrix)))
+
+# --------------------
+# 5) limma DE (vs-other)
+# --------------------
+design <- model.matrix(~ 0 + Segment, data = sample_info)
+colnames(design) <- make.names(gsub("^Segment", "", colnames(design)))
+
+fit <- lmFit(expr_matrix, design)
+
+n_C  <- sum(sample_info$Segment == "Cellular tumor")
+n_PN <- sum(sample_info$Segment == "Perinecrotic")
+n_PV <- sum(sample_info$Segment == "Perivascular")
+
+contrast_matrix <- makeContrasts(
+  Perinecrotic_vs_Other =
+    Perinecrotic - ((n_C/(n_C+n_PV))*Cellular.tumor + (n_PV/(n_C+n_PV))*Perivascular),
+  CellularTumor_vs_Other =
+    Cellular.tumor - ((n_PN/(n_PN+n_PV))*Perinecrotic + (n_PV/(n_PN+n_PV))*Perivascular),
+  Perivascular_vs_Other =
+    Perivascular - ((n_PN/(n_PN+n_C))*Perinecrotic + (n_C/(n_PN+n_C))*Cellular.tumor),
+  levels = design
+)
+
+fit2 <- eBayes(contrasts.fit(fit, contrast_matrix))
+cat("Available coefficients:\n")
+print(colnames(fit2$coefficients))
+
+# --------------------
+# 6) Membership map from Dataset.xlsx -> "Protein Counts"
+# --------------------
+sheet_name <- "Protein Counts"
+
+raw <- read_excel(SampleAnnotationFile, sheet = sheet_name, col_names = FALSE) |> as.data.frame()
+header_row <- which(apply(raw, 1, function(r) {
+  any(grepl("Target group membership/s", r, ignore.case = TRUE)) &&
+    any(grepl("Target Name", r, ignore.case = TRUE))
+}))[1]
+stopifnot(!is.na(header_row))
+
+prot_counts <- read_excel(SampleAnnotationFile, sheet = sheet_name, skip = header_row - 1,
+                          .name_repair = "unique") |> as.data.frame()
+
+name_col <- grep("target\\s*name", colnames(prot_counts), ignore.case = TRUE, value = TRUE)[1]
+mem_col  <- grep("membership|group", colnames(prot_counts), ignore.case = TRUE, value = TRUE)[1]
+stopifnot(!is.na(name_col), !is.na(mem_col))
+
+membership_map <- prot_counts %>%
+  transmute(
+    TargetName = str_trim(as.character(.data[[name_col]])),
+    Membership = str_trim(as.character(.data[[mem_col]]))
+  ) %>%
+  filter(TargetName != "", !is.na(TargetName),
+         Membership != "", !is.na(Membership)) %>%
+  distinct(TargetName, Membership)
+
+cat("Mapped targets:", n_distinct(membership_map$TargetName), "\n")
+
+# --------------------
+# 7) Summaries + nicer plotting
+# --------------------
+membership_summary_all <- function(fit_obj, coef_name, membership_map) {
+  tt <- topTable(fit_obj, coef = coef_name, number = Inf, sort.by = "none")
+  tt$TargetName <- rownames(tt)
+
+  tt %>%
+    left_join(membership_map, by = "TargetName") %>%
+    filter(!is.na(Membership), Membership != "") %>%
+    mutate(Membership = str_replace_all(Membership, ";", ",")) %>%
+    separate_rows(Membership, sep = ",\\s*") %>%
+    mutate(Membership = str_trim(Membership)) %>%
+    filter(Membership != "", !is.na(logFC)) %>%
+    group_by(Membership) %>%
+    summarize(
+      Average_logFC = mean(logFC, na.rm = TRUE),
+      Protein_Count = n(),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(abs(Average_logFC)))
+}
+
+save_membership_pdf <- function(summary_df, title, out_pdf, top_n = 25) {
+  out_pdf <- path.expand(out_pdf)
+  stopifnot(nrow(summary_df) > 0)
+
+  plot_df <- summary_df %>% slice_head(n = min(top_n, nrow(summary_df)))
+
+  # nice label with counts
+  plot_df <- plot_df %>%
+    mutate(Label = paste0(Membership, " (n=", Protein_Count, ")"))
+
+  # dynamic height
+  h <- min(max(0.32 * nrow(plot_df), 4.5), 15)
+
+  p <- ggplot(plot_df, aes(x = reorder(Label, Average_logFC), y = Average_logFC)) +
+    geom_col(alpha = 0.92) +
+    coord_flip() +
+    geom_hline(yintercept = 0, linewidth = 0.4) +
+    labs(
+      title = title,
+      subtitle = paste0("Top ", min(top_n, nrow(plot_df)), " groups by |average log2FC|"),
+      x = NULL,
+      y = "Average log2 fold-change (log2FC)"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      axis.text.y = element_text(size = 9),
+      panel.grid.major.y = element_blank()
+    )
+
+  ggsave(out_pdf, p, device = grDevices::pdf,
+         width = 10, height = h, units = "in",
+         bg = "white", useDingbats = FALSE)
+
+  message("Saved: ", out_pdf)
+  invisible(p)
+}
+
+# Build summaries
+sum_cell <- membership_summary_all(fit2, "CellularTumor_vs_Other", membership_map)
+sum_pn   <- membership_summary_all(fit2, "Perinecrotic_vs_Other", membership_map)
+sum_pv   <- membership_summary_all(fit2, "Perivascular_vs_Other", membership_map)
+
+# Save PDFs
+save_membership_pdf(sum_cell,
+  "Target-group membership effects: Cellular tumor vs Other",
+  "~/Desktop/CellularTumor_TargetGroup_Top25_AvgLog2FC.pdf",
+  top_n = 25)
+
+save_membership_pdf(sum_pn,
+  "Target-group membership effects: Perinecrotic vs Other",
+  "~/Desktop/Perinecrotic_TargetGroup_Top25_AvgLog2FC.pdf",
+  top_n = 25)
+
+save_membership_pdf(sum_pv,
+  "Target-group membership effects: Perivascular vs Other",
+  "~/Desktop/Perivascular_TargetGroup_Top25_AvgLog2FC.pdf",
+  top_n = 25)
