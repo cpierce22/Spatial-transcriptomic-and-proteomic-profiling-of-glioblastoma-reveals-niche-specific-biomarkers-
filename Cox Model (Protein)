@@ -1,0 +1,121 @@
+# -------------------- Load Required Libraries --------------------
+library(GeomxTools)
+library(survival)
+library(dplyr)
+library(ggplot2)
+
+# -------------------- Normalize and Log2 Transform --------------------
+proteinData <- normalize(
+  proteinData,
+  norm_method = "quant",
+  desiredQuantile = 0.75,
+  toElt = "q_norm"
+)
+
+log_q <- log2(assayDataElement(proteinData, "q_norm") + 1)
+log_q[is.infinite(log_q)] <- NA
+assayDataElement(proteinData, "log_q") <- log_q
+
+# -------------------- Extract Expression and Metadata --------------------
+log_expr <- assayDataElement(proteinData, "log_q")
+meta <- as.data.frame(pData(proteinData))
+
+# -------------------- Clean survival + relabel segments ONCE --------------------
+meta$Overall_survival_months <- as.numeric(trimws(as.character(meta$Overall_survival_months)))
+
+# Choose which segment column you want to use consistently:
+seg_col <- if ("Segment Tags" %in% colnames(meta)) "Segment Tags" else "Segment"
+
+meta[[seg_col]] <- trimws(as.character(meta[[seg_col]]))
+meta[[seg_col]][meta[[seg_col]] == "Necrosis"] <- "Perinecrotic"
+meta[[seg_col]][meta[[seg_col]] == "Vessel"]   <- "Perivascular"
+
+# Use these labels throughout
+segments <- c("Cellular tumor", "Perivascular", "Perinecrotic")
+cox_by_segment <- list()
+
+# -------------------- Segment-Specific Cox Models (Assume All Events) --------------------
+for (seg in segments) {
+  cat("\n🔎 Segment:", seg, "\n")
+  
+  idx <- which(meta[[seg_col]] == seg)
+  seg_expr <- log_expr[, idx, drop = FALSE]
+  seg_time <- as.numeric(meta$Overall_survival_months[idx])
+  seg_status <- rep(1, length(seg_time))  # testing: assume all died
+  valid <- !is.na(seg_time)
+  
+  if (sum(valid) < 3) {
+    cat("Not enough valid samples for", seg, "- skipping.\n")
+    next
+  }
+  
+  surv_obj <- Surv(time = seg_time[valid], event = seg_status[valid])
+  seg_expr <- seg_expr[, valid, drop = FALSE]
+  
+  seg_results <- lapply(rownames(seg_expr), function(protein) {
+    expr <- seg_expr[protein, ]
+    if (sd(expr, na.rm = TRUE) == 0 || length(unique(expr)) < 5) return(NULL)
+    model <- tryCatch(coxph(surv_obj ~ expr), error = function(e) NULL)
+    if (!is.null(model)) {
+      s <- summary(model)
+      data.frame(
+        Protein = protein,
+        HR = exp(coef(model)),
+        p.value = s$coefficients["expr", "Pr(>|z|)"],
+        beta = coef(model),
+        z = s$coefficients["expr", "z"]
+      )
+    } else NULL
+  })
+  
+  seg_results <- Filter(Negate(is.null), seg_results)
+  if (length(seg_results) > 0) {
+    seg_df <- do.call(rbind, seg_results)
+    seg_df$Segment <- seg
+    cox_by_segment[[seg]] <- seg_df[order(seg_df$p.value), ]
+  } else {
+    cat(" No valid models for", seg, "\n")
+  }
+}
+
+# -------------------- Plot Top 10 HR Proteins by Segment --------------------
+if (length(cox_by_segment) > 0) {
+  all_cox <- do.call(rbind, cox_by_segment)
+  filtered <- all_cox %>% filter(HR > 0.05 & HR < 20, p.value < 0.05)
+  
+  top10_hr <- filtered %>%
+    group_by(Segment) %>%
+    arrange(desc(HR)) %>%
+    slice_head(n = 10) %>%
+    ungroup()
+  
+  p <- ggplot(top10_hr, aes(x = reorder(Protein, HR), y = HR, fill = Segment)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    facet_wrap(~ Segment, scales = "free_y") +
+    scale_fill_manual(values = c(
+      "Cellular tumor" = "purple",
+      "Perivascular"   = "green",
+      "Perinecrotic"   = "orange"
+    )) +
+    labs(
+      title = "Top 10 Prognostic Proteins by Segment (HR)",
+      x = "Protein", y = "Hazard Ratio (HR)"
+    ) +
+    theme_minimal(base_size = 10)
+  
+  print(p)
+  
+  # Save 300 DPI to Desktop
+  ggsave("~/Desktop/Segment_Top10_HR.png", p, width = 10, height = 4.5, dpi = 300, bg = "white")
+  cat(" Saved high-res plot to Desktop as 'Segment_Top10_HR.png'\n")
+  
+} else {
+  cat(" No valid segment-specific Cox results available for plotting.\n")
+}
+
+
+
+
+
+
