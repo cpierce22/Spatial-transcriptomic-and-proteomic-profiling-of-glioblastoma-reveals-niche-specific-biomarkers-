@@ -1,0 +1,81 @@
+library(openxlsx)
+library(ggplot2)
+library(ggrepel)
+Necrosis_Vessel <- read.xlsx("Volcano Plot_Protein.xlsx", sheet = "Necrosis vs Vessel",
+startRow = 7)
+Necrosis_VesselVolPlot <- ggplot(data = Necrosis_Vessel, aes(x = Log2, y =
+`-log10.adjusted.pvalue`)) +
+geom_vline(xintercept = c(-1, 1), col = "black", linetype = 'dashed') +
+geom_hline(yintercept = -log10(0.05), col = "black", linetype = 'dashed') +
+geom_point(aes(colour = ifelse(Adjusted.pvalue <= 0.05 & abs(Log2) >= 1, "black", "grey")),
+size = 2) +
+scale_colour_manual(values = c("black" = "black", "grey" = "grey")) +
+xlim(-3, 3) +
+theme_minimal() +
+theme(
+panel.background = element_rect(fill = "white", colour = NA),
+panel.grid.major = element_line(colour = "gray"),
+panel.grid.minor = element_line(colour = "gray"),
+legend.position = "none"
+)
+windows()
+print(Necrosis_VesselVolPlot)
+
+Necrosis_Tumor <- read.xlsx("Volcano Plot_Protein.xlsx", sheet = "Necrosis vs Tumor",
+startRow = 7)
+Necrosis_TumorVolPlot <- ggplot(data = Necrosis_Tumor, aes(x = Log2, y =
+`-log10.adjusted.pvalue`)) +
+geom_vline(xintercept = c(-1, 1), col = "black", linetype = 'dashed') +
+geom_hline(yintercept = -log10(0.05), col = "black", linetype = 'dashed') +
+geom_point(aes(colour = ifelse(Adjusted.pvalue <= 0.05 & abs(Log2) >= 1, "black", "grey")),
+size = 2) +
+scale_colour_manual(values = c("black" = "black", "grey" = "grey")) +
+xlim(-4, 3) +
+theme_minimal() +
+theme(
+panel.background = element_rect(fill = "white", colour = NA),
+panel.grid.major = element_line(colour = "gray"),
+panel.grid.minor = element_line(colour = "gray"),
+legend.position = "none",
+text = element_text(colour = "black")
+
+) +
+geom_text_repel(aes(label = ifelse(Adjusted.pvalue <= 0.05 & (Log2 <= -2 | Log2 >= 1),
+Target.name, "")),
+colour = "black",
+vjust = -1,
+box.padding = 0.3,
+show.legend = FALSE)
+
+windows()
+print(Necrosis_TumorVolPlot)
+
+Vessel_Tumor <- read.xlsx("Volcano Plot_Protein.xlsx", sheet = "Vessel vs Tumor", startRow =
+7)
+Vessel_TumorVolPlot <- ggplot(data = Vessel_Tumor, aes(x = Log2, y =
+`-log10.adjusted.pvalue`)) +
+geom_vline(xintercept = c(-1, 1), col = "black", linetype = 'dashed') +
+geom_hline(yintercept = -log10(0.05), col = "black", linetype = 'dashed') +
+geom_point(aes(colour = ifelse(Adjusted.pvalue <= 0.05 & abs(Log2) >= 1, "black", "grey")),
+size = 2) +
+scale_colour_manual(values = c("black" = "black", "grey" = "grey")) +
+xlim(-4, 3) +
+theme_minimal() +
+theme(
+panel.background = element_rect(fill = "white", colour = NA),
+panel.grid.major = element_line(colour = "gray"),
+panel.grid.minor = element_line(colour = "gray"),
+legend.position = "none",
+text = element_text(colour = "black")
+) +
+geom_text_repel(aes(label = ifelse(Adjusted.pvalue <= 0.05 & abs(Log2) >= 1, Target.name,
+"")),
+
+colour = "black",
+vjust = -1,
+box.padding = 0.3,
+show.legend = FALSE)
+
+windows()
+print(Vessel_TumorVolPlot)
+
