@@ -1,0 +1,423 @@
+############################################################
+# GBM DSP Proteomics and Transcriptomics: PCA Analysis
+#
+# Purpose:
+#   This script performs principal component analysis (PCA) on
+#   NanoString GeoMx DSP proteomic and transcriptomic datasets.
+#   For each analyte, the most variable features are selected and
+#   PCA plots are generated with samples colored by tumor niche,
+#   sex, and brain region.
+#
+# Notes:
+#   - The proteomics workflow imports DCC/PKC files and annotation
+#     metadata directly from the specified data directory.
+#   - The transcriptomics workflow assumes that a processed GeoMxSet
+#     object named `target_demoData` already exists in the R environment
+#     and contains a log-transformed assay element named `log_q`.
+#   - Local file paths should be updated before reuse or public sharing.
+############################################################
+
+# ============================================================
+# 1. Package setup
+# ============================================================
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+cran_packages <- c(
+  "openxlsx", "dplyr", "stringr", "ggplot2", "ggrepel",
+  "patchwork", "matrixStats"
+)
+
+bioc_packages <- c(
+  "Biobase", "NanoStringNCTools", "GeomxTools", "GeoMxWorkflows"
+)
+
+install_if_missing <- function(pkgs, bioc = FALSE) {
+  for (pkg in pkgs) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      if (bioc) {
+        BiocManager::install(pkg, ask = FALSE, update = FALSE)
+      } else {
+        install.packages(pkg)
+      }
+    }
+  }
+}
+
+install_if_missing(cran_packages, bioc = FALSE)
+install_if_missing(bioc_packages, bioc = TRUE)
+
+suppressPackageStartupMessages({
+  library(Biobase)
+  library(NanoStringNCTools)
+  library(GeomxTools)
+  library(GeoMxWorkflows)
+  library(openxlsx)
+  library(dplyr)
+  library(stringr)
+  library(ggplot2)
+  library(ggrepel)
+  library(patchwork)
+  library(matrixStats)
+})
+
+# ============================================================
+# 2. User-defined paths and analysis parameters
+# ============================================================
+
+proteomic_datadir <- "/Users/sachibadola/Desktop/DSP/Gaur Lab/DSP_Proteomic"
+proteomic_annotation_file <- file.path(proteomic_datadir, "Dataset.xlsx")
+proteomic_annotation_sheet <- "Updated_Annotations for DSP"
+
+output_dir <- "/Users/sachibadola/Desktop"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Number of most variable features to use for PCA.
+proteomic_var_n <- 100
+transcriptomic_var_n <- 100
+
+# DCC files to exclude from proteomic analysis.
+exclude_dcc <- c(
+  "DSP-1001660011697-F-E07.dcc",
+  "DSP-1001660011697-F-E08.dcc",
+  "DSP-1001660011697-F-E09.dcc",
+  "DSP-1001660011697-F-E10.dcc",
+  "DSP-1001660011697-F-H02.dcc",
+  "DSP-1001660011697-F-A01.dcc"
+)
+
+# ============================================================
+# 3. Shared helper functions
+# ============================================================
+
+clean_segment <- function(x) {
+  x <- trimws(as.character(x))
+  x[x == "Vessel"] <- "Perivascular"
+  x[x == "Necrosis"] <- "Perinecrotic"
+  factor(x, levels = c("Cellular tumor", "Perivascular", "Perinecrotic"))
+}
+
+clean_sex <- function(x) {
+  x <- trimws(as.character(x))
+  x[x %in% c("", "NA", "N/A", "na", "Unknown", "unknown")] <- NA
+  x_low <- tolower(x)
+  out <- ifelse(
+    x_low %in% c("m", "male"), "Male",
+    ifelse(x_low %in% c("f", "female"), "Female", NA)
+  )
+  factor(out, levels = c("Male", "Female"))
+}
+
+clean_brain_region <- function(x) {
+  x <- trimws(as.character(x))
+  factor(x, levels = c("Frontal", "Parietal", "Temporal"))
+}
+
+get_assay_matrix <- function(geomx_obj, assay_name = "log_q") {
+  if (!assay_name %in% assayDataElementNames(geomx_obj)) {
+    stop("Assay element '", assay_name, "' was not found.")
+  }
+  mat <- assayDataElement(geomx_obj, assay_name)
+  mat <- as.matrix(mat)
+  mat[is.infinite(mat)] <- NA
+  mat <- mat[complete.cases(mat), , drop = FALSE]
+
+  if (nrow(mat) > 0) {
+    row_sd <- matrixStats::rowSds(mat, na.rm = TRUE)
+    mat <- mat[!is.na(row_sd) & row_sd > 0, , drop = FALSE]
+  }
+
+  mat
+}
+
+select_top_variable_features <- function(mat, n_features = 100) {
+  if (nrow(mat) < 2) {
+    stop("Expression matrix contains too few features after filtering.")
+  }
+
+  n_features <- min(n_features, nrow(mat))
+  feature_var <- matrixStats::rowVars(mat, na.rm = TRUE)
+  names(feature_var) <- rownames(mat)
+  top_features <- names(sort(feature_var, decreasing = TRUE))[seq_len(n_features)]
+
+  mat[top_features, , drop = FALSE]
+}
+
+run_pca <- function(mat) {
+  prcomp(t(mat), center = TRUE, scale. = TRUE)
+}
+
+make_pca_dataframe <- function(pca, metadata_df) {
+  percent_var <- pca$sdev^2 / sum(pca$sdev^2)
+
+  pca_df <- as.data.frame(pca$x[, 1:2, drop = FALSE])
+  colnames(pca_df) <- c("PC1", "PC2")
+  pca_df$Sample <- rownames(pca_df)
+
+  metadata_df$Sample <- rownames(metadata_df)
+  pca_df <- merge(pca_df, metadata_df, by = "Sample", all.x = TRUE)
+
+  list(
+    pca_df = pca_df,
+    xlab = paste0("PC1 (", round(percent_var[1] * 100, 1), "%)"),
+    ylab = paste0("PC2 (", round(percent_var[2] * 100, 1), "%)"),
+    percent_var = percent_var
+  )
+}
+
+plot_pca_panel <- function(pca_df, color_var, xlab, ylab, title, color_values = NULL) {
+  p <- ggplot(pca_df, aes(x = PC1, y = PC2, color = .data[[color_var]])) +
+    geom_point(size = 3, alpha = 0.90) +
+    theme_bw(base_size = 11) +
+    labs(title = title, x = xlab, y = ylab, color = title) +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      panel.grid.minor = element_blank()
+    )
+
+  if (!is.null(color_values)) {
+    p <- p + scale_color_manual(values = color_values, na.value = "grey70", drop = FALSE)
+  }
+
+  p
+}
+
+make_three_panel_pca <- function(pca_results, figure_title = NULL) {
+  pca_df <- pca_results$pca_df
+
+  segment_cols <- c(
+    "Cellular tumor" = "purple",
+    "Perivascular"   = "green",
+    "Perinecrotic"   = "orange"
+  )
+
+  sex_cols <- c(
+    "Male"   = "#4C78A8",
+    "Female" = "#E45756"
+  )
+
+  brain_cols <- c(
+    "Frontal"  = "#a6761d",
+    "Parietal" = "#1f78b4",
+    "Temporal" = "#666666"
+  )
+
+  p_segment <- plot_pca_panel(
+    pca_df = pca_df,
+    color_var = "Segment",
+    xlab = pca_results$xlab,
+    ylab = pca_results$ylab,
+    title = "Segment",
+    color_values = segment_cols
+  )
+
+  p_sex <- plot_pca_panel(
+    pca_df = pca_df,
+    color_var = "Sex",
+    xlab = pca_results$xlab,
+    ylab = pca_results$ylab,
+    title = "Sex",
+    color_values = sex_cols
+  )
+
+  p_brain <- plot_pca_panel(
+    pca_df = pca_df,
+    color_var = "Brain_region",
+    xlab = pca_results$xlab,
+    ylab = pca_results$ylab,
+    title = "Brain Region",
+    color_values = brain_cols
+  )
+
+  combined <- p_segment + p_sex + p_brain + plot_layout(nrow = 1)
+
+  if (!is.null(figure_title)) {
+    combined <- combined + plot_annotation(title = figure_title)
+  }
+
+  combined
+}
+
+save_pca_outputs <- function(pca_plot, pca_results, out_prefix, width = 11, height = 4) {
+  pdf_file <- file.path(output_dir, paste0(out_prefix, "_PCA_3panel.pdf"))
+  csv_file <- file.path(output_dir, paste0(out_prefix, "_PCA_scores.csv"))
+
+  ggsave(pdf_file, pca_plot, width = width, height = height, device = cairo_pdf)
+  write.csv(pca_results$pca_df, csv_file, row.names = FALSE)
+
+  message("Saved PCA figure: ", pdf_file)
+  message("Saved PCA scores: ", csv_file)
+}
+
+# ============================================================
+# 4. Proteomic PCA workflow
+# ============================================================
+
+message("\n--- Running proteomic PCA workflow ---")
+
+DCCFiles <- list.files(
+  path = proteomic_datadir,
+  pattern = "\\.dcc$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+PKCFiles <- list.files(
+  path = proteomic_datadir,
+  pattern = "\\.pkc$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+DCCFiles <- DCCFiles[!basename(DCCFiles) %in% exclude_dcc]
+
+if (length(DCCFiles) == 0) stop("No DCC files found after exclusion.")
+if (length(PKCFiles) == 0) stop("No PKC files found.")
+
+proteinData <- suppressWarnings(
+  readNanoStringGeoMxSet(
+    dccFiles = DCCFiles,
+    pkcFiles = PKCFiles,
+    phenoDataFile = proteomic_annotation_file,
+    phenoDataSheet = proteomic_annotation_sheet,
+    phenoDataDccColName = "Sample_ID",
+    protocolDataColNames = c("ROI_ID", "Segment Tags"),
+    analyte = "Protein"
+  )
+)
+
+proteinData <- setSegmentQCFlags(
+  proteinData,
+  qcCutoffs = list(
+    percentSaturation = 45,
+    minSegmentReads   = 1000,
+    percentAligned    = 80,
+    minNegativeCount  = 10,
+    maxNTCCount       = 60,
+    minNuclei         = 16000,
+    minArea           = 20
+  )
+)
+
+# Remove low-saturation ROIs when flagged.
+qc_flags_df <- as.data.frame(protocolData(proteinData)[["QCFlags"]])
+if ("LowSaturation" %in% colnames(qc_flags_df)) {
+  low_saturation <- which(qc_flags_df[, "LowSaturation"] == TRUE)
+  if (length(low_saturation) > 0) {
+    proteinData <- proteinData[, -low_saturation]
+    message("Removed ", length(low_saturation), " low-saturation proteomic ROI(s).")
+  }
+}
+
+# Quantile normalization followed by log2 transformation.
+proteinData <- normalize(
+  proteinData,
+  norm_method = "quant",
+  desiredQuantile = 0.75,
+  toElt = "q_norm"
+)
+
+assayDataElement(proteinData, "log_q") <- assayDataApply(
+  proteinData,
+  2,
+  log,
+  base = 2,
+  elt = "q_norm"
+)
+
+# Clean proteomic metadata.
+pd_protein <- as.data.frame(pData(proteinData), stringsAsFactors = FALSE)
+colnames(pd_protein) <- trimws(colnames(pd_protein))
+
+required_protein_cols <- c("Segment", "Brain_region", "Gender")
+missing_protein_cols <- setdiff(required_protein_cols, colnames(pd_protein))
+if (length(missing_protein_cols) > 0) {
+  stop("Missing proteomic metadata column(s): ", paste(missing_protein_cols, collapse = ", "))
+}
+
+pd_protein$Segment <- clean_segment(pd_protein$Segment)
+pd_protein$Brain_region <- clean_brain_region(pd_protein$Brain_region)
+pd_protein$Sex <- clean_sex(pd_protein$Gender)
+
+rownames(pd_protein) <- colnames(proteinData)
+pData(proteinData) <- pd_protein
+
+# Run proteomic PCA.
+protein_mat <- get_assay_matrix(proteinData, assay_name = "log_q")
+protein_mat_top <- select_top_variable_features(protein_mat, n_features = proteomic_var_n)
+protein_pca <- run_pca(protein_mat_top)
+protein_pca_results <- make_pca_dataframe(protein_pca, pd_protein)
+
+protein_pca_plot <- make_three_panel_pca(
+  protein_pca_results,
+  figure_title = paste0("Proteomic PCA: top ", nrow(protein_mat_top), " variable proteins")
+)
+
+save_pca_outputs(
+  pca_plot = protein_pca_plot,
+  pca_results = protein_pca_results,
+  out_prefix = "GBM_DSP_proteomic"
+)
+
+# ============================================================
+# 5. Transcriptomic PCA workflow
+# ============================================================
+
+message("\n--- Running transcriptomic PCA workflow ---")
+
+if (!exists("target_demoData")) {
+  warning(
+    "Object `target_demoData` was not found. ",
+    "Skipping transcriptomic PCA. Load the processed RNA GeoMxSet object ",
+    "with a `log_q` assay element before running this section."
+  )
+} else {
+  pd_rna <- as.data.frame(pData(target_demoData), stringsAsFactors = FALSE)
+  colnames(pd_rna) <- trimws(colnames(pd_rna))
+
+  required_rna_cols <- c("Segment", "Brain_region", "Gender")
+  missing_rna_cols <- setdiff(required_rna_cols, colnames(pd_rna))
+  if (length(missing_rna_cols) > 0) {
+    stop("Missing transcriptomic metadata column(s): ", paste(missing_rna_cols, collapse = ", "))
+  }
+
+  pd_rna$Segment <- clean_segment(pd_rna$Segment)
+  pd_rna$Brain_region <- clean_brain_region(pd_rna$Brain_region)
+  pd_rna$Sex <- clean_sex(pd_rna$Gender)
+
+  rownames(pd_rna) <- colnames(target_demoData)
+  pData(target_demoData) <- pd_rna
+
+  rna_mat <- get_assay_matrix(target_demoData, assay_name = "log_q")
+  rna_mat_top <- select_top_variable_features(rna_mat, n_features = transcriptomic_var_n)
+  rna_pca <- run_pca(rna_mat_top)
+  rna_pca_results <- make_pca_dataframe(rna_pca, pd_rna)
+
+  rna_pca_plot <- make_three_panel_pca(
+    rna_pca_results,
+    figure_title = paste0("Transcriptomic PCA: top ", nrow(rna_mat_top), " variable genes")
+  )
+
+  save_pca_outputs(
+    pca_plot = rna_pca_plot,
+    pca_results = rna_pca_results,
+    out_prefix = "GBM_DSP_transcriptomic"
+  )
+}
+
+# ============================================================
+# 6. Optional combined figure
+# ============================================================
+
+if (exists("protein_pca_plot") && exists("rna_pca_plot")) {
+  combined_pca_plot <- protein_pca_plot / rna_pca_plot +
+    plot_annotation(title = "GBM DSP PCA of Proteomic and Transcriptomic Profiles")
+
+  combined_pdf <- file.path(output_dir, "GBM_DSP_combined_proteomic_transcriptomic_PCA.pdf")
+  ggsave(combined_pdf, combined_pca_plot, width = 11, height = 8.5, device = cairo_pdf)
+  message("Saved combined PCA figure: ", combined_pdf)
+}
+
+message("\nPCA analysis complete.")
