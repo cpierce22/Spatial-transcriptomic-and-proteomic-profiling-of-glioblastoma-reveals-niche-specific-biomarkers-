@@ -1,0 +1,787 @@
+
+# ============================================================
+# GBM DSP Pathway / Target-Group Analysis
+# Proteomics + Transcriptomics
+# ============================================================
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+cran_pkgs <- c(
+  "dplyr", "tidyr", "ggplot2", "stringr",
+  "readxl", "openxlsx", "tidyverse"
+)
+
+bioc_pkgs <- c(
+  "NanoStringNCTools", "GeomxTools",
+  "GeoMxWorkflows", "limma"
+)
+
+for (pkg in cran_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+for (pkg in bioc_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, ask = FALSE)
+  }
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(stringr)
+  library(readxl)
+  library(openxlsx)
+  library(NanoStringNCTools)
+  library(GeomxTools)
+  library(GeoMxWorkflows)
+  library(limma)
+})
+
+# ============================================================
+# GLOBAL SETTINGS
+# ============================================================
+
+datadir <- "/Users/sachibadola/Desktop/DSP/Gaur Lab/DSP_Proteomic"
+SampleAnnotationFile <- file.path(datadir, "Dataset.xlsx")
+
+output_dir <- "~/Desktop"
+
+exclude_dcc <- c(
+  "DSP-1001660011697-F-E07.dcc",
+  "DSP-1001660011697-F-E08.dcc",
+  "DSP-1001660011697-F-E09.dcc",
+  "DSP-1001660011697-F-E10.dcc",
+  "DSP-1001660011697-F-H02.dcc",
+  "DSP-1001660011697-F-A01.dcc"
+)
+
+# ============================================================
+# PART 1: SIMPLE PATHWAY SUMMARY FROM CSV WITH PATHWAY FDR
+# ============================================================
+
+plot_pathway_summary_from_csv <- function(
+    csv_file,
+    region_name,
+    top_n = 5,
+    output_file = NULL
+) {
+  
+  df <- read.csv(csv_file, stringsAsFactors = FALSE)
+  
+  if (!all(c("Pathways", "logFC") %in% colnames(df))) {
+    stop("CSV must contain columns named 'Pathways' and 'logFC'.")
+  }
+  
+  df_expanded <- df %>%
+    mutate(Pathways = trimws(Pathways)) %>%
+    filter(!is.na(Pathways), Pathways != "") %>%
+    separate_rows(Pathways, sep = ";") %>%
+    mutate(Pathways = trimws(Pathways)) %>%
+    filter(Pathways != "", !is.na(logFC))
+  
+  pathway_summary <- df_expanded %>%
+    group_by(Pathways) %>%
+    summarise(
+      mean_logFC = mean(logFC, na.rm = TRUE),
+      median_logFC = median(logFC, na.rm = TRUE),
+      n_features = n(),
+      pathway_p_value = ifelse(
+        n_features >= 2,
+        t.test(logFC, mu = 0)$p.value,
+        NA_real_
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      pathway_adj_p_value = p.adjust(pathway_p_value, method = "BH")
+    )
+  
+  top_up <- pathway_summary %>%
+    arrange(desc(mean_logFC)) %>%
+    slice_head(n = top_n) %>%
+    mutate(Direction = "Upregulated")
+  
+  top_down <- pathway_summary %>%
+    arrange(mean_logFC) %>%
+    slice_head(n = top_n) %>%
+    mutate(Direction = "Downregulated")
+  
+  plot_data <- bind_rows(top_up, top_down) %>%
+    mutate(
+      FDR_label = ifelse(
+        is.na(pathway_adj_p_value),
+        "FDR=NA",
+        paste0("FDR=", signif(pathway_adj_p_value, 2))
+      ),
+      Label = paste0(
+        Pathways,
+        " (n=", n_features,
+        ", ", FDR_label,
+        ")"
+      )
+    )
+  
+  p <- ggplot(
+    plot_data,
+    aes(x = reorder(Label, mean_logFC), y = mean_logFC, fill = Direction)
+  ) +
+    geom_col() +
+    coord_flip() +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_fill_manual(values = c(
+      "Upregulated" = "firebrick",
+      "Downregulated" = "steelblue"
+    )) +
+    labs(
+      title = paste0("Top Up- and Downregulated Pathways: ", region_name),
+      subtitle = "Pathway FDR calculated from one-sample t-tests of protein log2FC values against zero",
+      x = NULL,
+      y = "Average log2 fold change"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      plot.subtitle = element_text(size = 9),
+      legend.position = "top",
+      panel.grid.major.y = element_blank()
+    )
+  
+  if (!is.null(output_file)) {
+    ggsave(
+      filename = output_file,
+      plot = p,
+      device = "pdf",
+      width = 11,
+      height = 6,
+      units = "in",
+      bg = "white",
+      useDingbats = FALSE
+    )
+  }
+  
+  return(list(
+    plot = p,
+    pathway_summary = pathway_summary,
+    plot_data = plot_data
+  ))
+}
+
+# Example:
+# cell_pathway_results <- plot_pathway_summary_from_csv(
+#   csv_file = "CellularTumor57.csv",
+#   region_name = "Cellular Tumor",
+#   top_n = 5,
+#   output_file = file.path(path.expand(output_dir), "CellularTumor_PathwaySummary_with_FDR.pdf")
+# )
+#
+# View pathway p-values:
+# cell_pathway_results$pathway_summary
+
+# ============================================================
+# PART 2: PROTEOMICS TARGET-GROUP / PATHWAY ANALYSIS FROM GEOMX
+# ============================================================
+
+DCCFiles <- dir(
+  datadir,
+  pattern = "\\.[dD][cC][cC]$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+PKCFiles <- dir(
+  datadir,
+  pattern = "\\.[pP][kK][cC]$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+DCCFiles <- DCCFiles[
+  !tolower(basename(DCCFiles)) %in% tolower(exclude_dcc)
+]
+
+if (length(DCCFiles) == 0) stop("No DCC files found after exclusions.")
+if (length(PKCFiles) == 0) stop("No PKC files found.")
+
+proteinData <- suppressWarnings(
+  readNanoStringGeoMxSet(
+    dccFiles = DCCFiles,
+    pkcFiles = PKCFiles,
+    phenoDataFile = SampleAnnotationFile,
+    phenoDataSheet = "Updated_Annotations for DSP",
+    phenoDataDccColName = "Sample_ID",
+    analyte = "Protein"
+  )
+)
+
+proteinData <- setSegmentQCFlags(
+  proteinData,
+  qcCutoffs = list(
+    percentSaturation = 45,
+    minSegmentReads   = 1000,
+    percentAligned    = 80,
+    minNegativeCount  = 10,
+    maxNTCCount       = 60,
+    minNuclei         = 16000,
+    minArea           = 20
+  )
+)
+
+proteinData <- normalize(
+  proteinData,
+  norm_method = "quant",
+  desiredQuantile = 0.75,
+  toElt = "q_norm"
+)
+
+assayDataElement(proteinData, "log2_q") <- log2(
+  assayDataElement(proteinData, "q_norm") + 1
+)
+
+qc_flags <- as.data.frame(protocolData(proteinData)[["QCFlags"]])
+
+if ("LowSaturation" %in% colnames(qc_flags)) {
+  lowSaturation <- which(qc_flags$LowSaturation == TRUE)
+  if (length(lowSaturation) > 0) {
+    proteinData <- proteinData[, -lowSaturation]
+  }
+}
+
+expr_matrix <- assayDataElement(proteinData, "log2_q")
+
+sample_info <- as.data.frame(pData(proteinData))
+rownames(sample_info) <- sampleNames(proteinData)
+
+seg_col <- if ("Segment Tags" %in% colnames(sample_info)) {
+  "Segment Tags"
+} else {
+  "Segment"
+}
+
+sample_info$Segment <- trimws(as.character(sample_info[[seg_col]]))
+
+sample_info$Segment[sample_info$Segment == "Necrosis"] <- "Perinecrotic"
+sample_info$Segment[sample_info$Segment == "Vessel"]   <- "Perivascular"
+
+sample_info$Segment <- factor(
+  sample_info$Segment,
+  levels = c("Cellular tumor", "Perinecrotic", "Perivascular")
+)
+
+sample_info <- sample_info[colnames(expr_matrix), , drop = FALSE]
+
+if (!identical(rownames(sample_info), colnames(expr_matrix))) {
+  stop("Sample metadata and expression matrix are not aligned.")
+}
+
+design <- model.matrix(~ 0 + Segment, data = sample_info)
+colnames(design) <- make.names(gsub("^Segment", "", colnames(design)))
+
+fit <- lmFit(expr_matrix, design)
+
+n_C  <- sum(sample_info$Segment == "Cellular tumor")
+n_PN <- sum(sample_info$Segment == "Perinecrotic")
+n_PV <- sum(sample_info$Segment == "Perivascular")
+
+contrast_matrix <- makeContrasts(
+  Perinecrotic_vs_Other =
+    Perinecrotic - (
+      (n_C / (n_C + n_PV)) * Cellular.tumor +
+        (n_PV / (n_C + n_PV)) * Perivascular
+    ),
+  
+  CellularTumor_vs_Other =
+    Cellular.tumor - (
+      (n_PN / (n_PN + n_PV)) * Perinecrotic +
+        (n_PV / (n_PN + n_PV)) * Perivascular
+    ),
+  
+  Perivascular_vs_Other =
+    Perivascular - (
+      (n_PN / (n_PN + n_C)) * Perinecrotic +
+        (n_C / (n_PN + n_C)) * Cellular.tumor
+    ),
+  
+  levels = design
+)
+
+fit2 <- eBayes(contrasts.fit(fit, contrast_matrix))
+
+# ============================================================
+# TARGET-GROUP MEMBERSHIP MAP
+# ============================================================
+
+load_membership_map <- function(annotation_file, sheet_name = "Protein Counts") {
+  
+  raw <- read_excel(annotation_file, sheet = sheet_name, col_names = FALSE) %>%
+    as.data.frame()
+  
+  header_row <- which(apply(raw, 1, function(r) {
+    any(grepl("Target group membership/s", r, ignore.case = TRUE)) &&
+      any(grepl("Target Name", r, ignore.case = TRUE))
+  }))[1]
+  
+  if (is.na(header_row)) {
+    stop("Could not identify header row containing target name and membership columns.")
+  }
+  
+  prot_counts <- read_excel(
+    annotation_file,
+    sheet = sheet_name,
+    skip = header_row - 1,
+    .name_repair = "unique"
+  ) %>%
+    as.data.frame()
+  
+  name_col <- grep("target\\s*name", colnames(prot_counts), ignore.case = TRUE, value = TRUE)[1]
+  mem_col  <- grep("membership|group", colnames(prot_counts), ignore.case = TRUE, value = TRUE)[1]
+  
+  if (is.na(name_col) || is.na(mem_col)) {
+    stop("Could not identify target name or membership column.")
+  }
+  
+  membership_map <- prot_counts %>%
+    transmute(
+      TargetName = str_trim(as.character(.data[[name_col]])),
+      Membership = str_trim(as.character(.data[[mem_col]]))
+    ) %>%
+    filter(
+      !is.na(TargetName), TargetName != "",
+      !is.na(Membership), Membership != ""
+    ) %>%
+    distinct(TargetName, Membership)
+  
+  return(membership_map)
+}
+
+membership_map <- load_membership_map(SampleAnnotationFile)
+
+# ============================================================
+# SUMMARIZE MEMBERSHIP EFFECTS WITH P-VALUES/FDR
+# ============================================================
+
+summarize_membership_effects <- function(fit_obj, coef_name, membership_map) {
+  
+  tt <- topTable(
+    fit_obj,
+    coef = coef_name,
+    number = Inf,
+    sort.by = "none"
+  )
+  
+  tt$TargetName <- rownames(tt)
+  
+  summary_df <- tt %>%
+    left_join(membership_map, by = "TargetName") %>%
+    filter(!is.na(Membership), Membership != "") %>%
+    mutate(Membership = str_replace_all(Membership, ";", ",")) %>%
+    separate_rows(Membership, sep = ",\\s*") %>%
+    mutate(Membership = str_trim(Membership)) %>%
+    filter(Membership != "", !is.na(logFC)) %>%
+    group_by(Membership) %>%
+    summarize(
+      Average_logFC = mean(logFC, na.rm = TRUE),
+      Median_logFC = median(logFC, na.rm = TRUE),
+      Protein_Count = n(),
+      pathway_p_value = ifelse(
+        Protein_Count >= 2,
+        t.test(logFC, mu = 0)$p.value,
+        NA_real_
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      pathway_adj_p_value = p.adjust(pathway_p_value, method = "BH")
+    ) %>%
+    arrange(desc(abs(Average_logFC)))
+  
+  return(summary_df)
+}
+
+# ============================================================
+# PLOT MEMBERSHIP SUMMARY WITH FDR LABELS
+# ============================================================
+
+plot_membership_summary <- function(
+    summary_df,
+    title,
+    top_n = 25,
+    output_file = NULL
+) {
+  
+  if (nrow(summary_df) == 0) {
+    stop("No membership summary data available for plotting.")
+  }
+  
+  plot_df <- summary_df %>%
+    slice_head(n = min(top_n, nrow(summary_df))) %>%
+    mutate(
+      Direction = ifelse(
+        Average_logFC >= 0,
+        "Positive average logFC",
+        "Negative average logFC"
+      ),
+      FDR_label = ifelse(
+        is.na(pathway_adj_p_value),
+        "FDR=NA",
+        paste0("FDR=", signif(pathway_adj_p_value, 2))
+      ),
+      Label = paste0(
+        Membership,
+        " (n=", Protein_Count,
+        ", ", FDR_label,
+        ")"
+      )
+    )
+  
+  height_use <- min(max(0.34 * nrow(plot_df), 5), 16)
+  
+  p <- ggplot(
+    plot_df,
+    aes(x = reorder(Label, Average_logFC), y = Average_logFC, fill = Direction)
+  ) +
+    geom_col(alpha = 0.95) +
+    coord_flip() +
+    geom_hline(yintercept = 0, linewidth = 0.4) +
+    scale_fill_manual(values = c(
+      "Positive average logFC" = "firebrick",
+      "Negative average logFC" = "steelblue"
+    )) +
+    labs(
+      title = title,
+      subtitle = paste0(
+        "Top ", min(top_n, nrow(plot_df)),
+        " groups by absolute average log2FC; FDR from one-sample t-tests of protein log2FC values"
+      ),
+      x = NULL,
+      y = "Average log2 fold change"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      plot.subtitle = element_text(size = 9),
+      legend.position = "top",
+      axis.text.y = element_text(size = 8),
+      panel.grid.major.y = element_blank()
+    )
+  
+  if (!is.null(output_file)) {
+    ggsave(
+      filename = output_file,
+      plot = p,
+      device = "pdf",
+      width = 12,
+      height = height_use,
+      units = "in",
+      bg = "white",
+      useDingbats = FALSE
+    )
+  }
+  
+  return(p)
+}
+
+# ============================================================
+# GENERATE PROTEOMIC PATHWAY / MEMBERSHIP PLOTS
+# ============================================================
+
+sum_cell <- summarize_membership_effects(
+  fit_obj = fit2,
+  coef_name = "CellularTumor_vs_Other",
+  membership_map = membership_map
+)
+
+sum_pn <- summarize_membership_effects(
+  fit_obj = fit2,
+  coef_name = "Perinecrotic_vs_Other",
+  membership_map = membership_map
+)
+
+sum_pv <- summarize_membership_effects(
+  fit_obj = fit2,
+  coef_name = "Perivascular_vs_Other",
+  membership_map = membership_map
+)
+
+p_cell <- plot_membership_summary(
+  summary_df = sum_cell,
+  title = "Proteomics: Target-Group Membership Effects in Cellular Tumor",
+  top_n = 25,
+  output_file = file.path(
+    path.expand(output_dir),
+    "CellularTumor_TargetGroup_Top25_AvgLog2FC_with_FDR.pdf"
+  )
+)
+
+p_pn <- plot_membership_summary(
+  summary_df = sum_pn,
+  title = "Proteomics: Target-Group Membership Effects in Perinecrotic Regions",
+  top_n = 25,
+  output_file = file.path(
+    path.expand(output_dir),
+    "Perinecrotic_TargetGroup_Top25_AvgLog2FC_with_FDR.pdf"
+  )
+)
+
+p_pv <- plot_membership_summary(
+  summary_df = sum_pv,
+  title = "Proteomics: Target-Group Membership Effects in Perivascular Regions",
+  top_n = 25,
+  output_file = file.path(
+    path.expand(output_dir),
+    "Perivascular_TargetGroup_Top25_AvgLog2FC_with_FDR.pdf"
+  )
+)
+
+# View pathway-level p-values/FDR tables:
+sum_cell
+sum_pn
+sum_pv
+
+# ============================================================
+# PART 3: TRANSCRIPTOMIC TOP-GENE / PATHWAY-STYLE SUMMARY
+# ============================================================
+# This section assumes the following objects already exist:
+#   - top_necrosis
+#   - top_cellular
+#   - top_vessel
+#
+# Each object should be a list with:
+#   - $up
+#   - $down
+#
+# Each up/down dataframe should include:
+#   - TargetName
+#   - logFC
+
+prepare_top_gene_plot_data <- function(gene_data, region_name) {
+  
+  if (!all(c("up", "down") %in% names(gene_data))) {
+    stop("gene_data must contain $up and $down dataframes.")
+  }
+  
+  up <- gene_data$up
+  down <- gene_data$down
+  
+  up$Direction <- "Upregulated"
+  down$Direction <- "Downregulated"
+  
+  combined <- bind_rows(up, down) %>%
+    mutate(
+      Region = region_name,
+      Gene_Label = paste0(TargetName, "_", region_name)
+    )
+  
+  return(combined)
+}
+
+plot_transcriptomic_top_genes <- function(
+    top_necrosis,
+    top_cellular,
+    top_vessel,
+    top_n = 10,
+    output_file = file.path(path.expand(output_dir), "RNA_TopGenes_ByRegion.pdf")
+) {
+  
+  plot_data <- bind_rows(
+    prepare_top_gene_plot_data(top_necrosis, "Perinecrotic"),
+    prepare_top_gene_plot_data(top_cellular, "Cellular Tumor"),
+    prepare_top_gene_plot_data(top_vessel, "Perivascular")
+  )
+  
+  plot_data <- plot_data %>%
+    filter(!is.na(TargetName), !is.na(logFC)) %>%
+    arrange(Region, Direction, desc(abs(logFC)))
+  
+  plot_data$Gene_Label <- factor(
+    plot_data$Gene_Label,
+    levels = unique(plot_data$Gene_Label)
+  )
+  
+  plot_data <- bind_rows(top_up, top_down) %>%
+    mutate(
+      Label = paste0(
+        Pathways,
+        " (n=", n_features,
+        ", FDR=", signif(pathway_adj_p_value, 2),
+        ")"
+      )
+    )
+  
+  p <- ggplot(plot_data, aes(x = Gene_Label, y = logFC, fill = Direction)) +
+    geom_col(show.legend = TRUE) +
+    facet_wrap(~Region, scales = "free_y", ncol = 1) +
+    coord_flip() +
+    scale_fill_manual(values = c(
+      "Upregulated" = "firebrick",
+      "Downregulated" = "steelblue"
+    )) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_x_discrete(labels = function(x) sub("_[^_]+$", "", x)) +
+    labs(
+      title = paste0("Transcriptomics: Top ", top_n, " Up- and Downregulated Genes by Tumor Region"),
+      x = "Gene",
+      y = "log fold change"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      strip.text = element_text(size = 12, face = "bold"),
+      axis.text.y = element_text(size = 9, face = "bold"),
+      legend.position = "top",
+      plot.title = element_text(face = "bold")
+    )
+  
+  ggsave(
+    filename = output_file,
+    plot = p,
+    device = "pdf",
+    width = 12,
+    height = 18,
+    units = "in",
+    bg = "white",
+    useDingbats = FALSE
+  )
+  
+  return(p)
+}
+
+# Run RNA plot only if required objects exist
+if (
+  exists("top_necrosis") &&
+  exists("top_cellular") &&
+  exists("top_vessel")
+) {
+  p_rna_top_genes <- plot_transcriptomic_top_genes(
+    top_necrosis = top_necrosis,
+    top_cellular = top_cellular,
+    top_vessel = top_vessel,
+    top_n = ifelse(exists("top_n"), top_n, 10),
+    output_file = file.path(path.expand(output_dir), "RNA_TopGenes_ByRegion.pdf")
+  )
+}
+
+# ============================================================
+# END
+# ============================================================
+
+# ============================================================
+# PART 3: TRANSCRIPTOMIC TOP-GENE / PATHWAY-STYLE SUMMARY
+# ============================================================
+# This section assumes the following objects already exist:
+#   - top_necrosis
+#   - top_cellular
+#   - top_vessel
+#
+# Each object should be a list with:
+#   - $up
+#   - $down
+#
+# Each up/down dataframe should include:
+#   - TargetName
+#   - logFC
+
+prepare_top_gene_plot_data <- function(gene_data, region_name) {
+  
+  if (!all(c("up", "down") %in% names(gene_data))) {
+    stop("gene_data must contain $up and $down dataframes.")
+  }
+  
+  up <- gene_data$up
+  down <- gene_data$down
+  
+  up$Direction <- "Upregulated"
+  down$Direction <- "Downregulated"
+  
+  combined <- bind_rows(up, down) %>%
+    mutate(
+      Region = region_name,
+      Gene_Label = paste0(TargetName, "_", region_name)
+    )
+  
+  return(combined)
+}
+
+plot_transcriptomic_top_genes <- function(
+  top_necrosis,
+  top_cellular,
+  top_vessel,
+  top_n = 10,
+  output_file = file.path(path.expand(output_dir), "RNA_TopGenes_ByRegion.pdf")
+) {
+  
+  plot_data <- bind_rows(
+    prepare_top_gene_plot_data(top_necrosis, "Perinecrotic"),
+    prepare_top_gene_plot_data(top_cellular, "Cellular Tumor"),
+    prepare_top_gene_plot_data(top_vessel, "Perivascular")
+  )
+  
+  plot_data <- plot_data %>%
+    filter(!is.na(TargetName), !is.na(logFC)) %>%
+    arrange(Region, Direction, desc(abs(logFC)))
+  
+  plot_data$Gene_Label <- factor(
+    plot_data$Gene_Label,
+    levels = unique(plot_data$Gene_Label)
+  )
+  
+  p <- ggplot(plot_data, aes(x = Gene_Label, y = logFC, fill = Direction)) +
+    geom_col(show.legend = TRUE) +
+    facet_wrap(~Region, scales = "free_y", ncol = 1) +
+    coord_flip() +
+    scale_fill_manual(values = c(
+      "Upregulated" = "firebrick",
+      "Downregulated" = "steelblue"
+    )) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_x_discrete(labels = function(x) sub("_[^_]+$", "", x)) +
+    labs(
+      title = paste0("Transcriptomics: Top ", top_n, " Up- and Downregulated Genes by Tumor Region"),
+      x = "Gene",
+      y = "log fold change"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      strip.text = element_text(size = 12, face = "bold"),
+      axis.text.y = element_text(size = 9, face = "bold"),
+      legend.position = "top",
+      plot.title = element_text(face = "bold")
+    )
+  
+  ggsave(
+    filename = output_file,
+    plot = p,
+    device = "pdf",
+    width = 12,
+    height = 18,
+    units = "in",
+    bg = "white",
+    useDingbats = FALSE
+  )
+  
+  return(p)
+}
+
+# Run RNA plot only if required objects exist
+if (
+  exists("top_necrosis") &&
+  exists("top_cellular") &&
+  exists("top_vessel")
+) {
+  p_rna_top_genes <- plot_transcriptomic_top_genes(
+    top_necrosis = top_necrosis,
+    top_cellular = top_cellular,
+    top_vessel = top_vessel,
+    top_n = ifelse(exists("top_n"), top_n, 10),
+    output_file = file.path(path.expand(output_dir), "RNA_TopGenes_ByRegion.pdf")
+  )
+}
+
+# ============================================================
+# END
+# ============================================================
+
