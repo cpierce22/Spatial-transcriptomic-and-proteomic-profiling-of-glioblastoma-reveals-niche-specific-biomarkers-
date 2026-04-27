@@ -1,0 +1,345 @@
+# ============================================================
+# GBM DSP Cox Modeling: Proteomics + Transcriptomics
+# Segment-specific survival association analysis
+# ============================================================
+
+# -------------------- Load Required Libraries --------------------
+suppressPackageStartupMessages({
+  library(GeomxTools)
+  library(survival)
+  library(dplyr)
+  library(ggplot2)
+  library(forcats)
+})
+
+# ============================================================
+# GLOBAL SETTINGS
+# ============================================================
+
+output_dir <- "~/Desktop"
+
+segments <- c("Cellular tumor", "Perivascular", "Perinecrotic")
+
+segment_colors <- c(
+  "Cellular tumor" = "purple",
+  "Perivascular"   = "green",
+  "Perinecrotic"   = "orange"
+)
+
+# ============================================================
+# HELPER FUNCTION: CLEAN SEGMENT LABELS
+# ============================================================
+
+clean_segment_labels <- function(meta) {
+  
+  seg_col <- if ("Segment Tags" %in% colnames(meta)) {
+    "Segment Tags"
+  } else {
+    "Segment"
+  }
+  
+  meta[[seg_col]] <- trimws(as.character(meta[[seg_col]]))
+  
+  meta[[seg_col]][meta[[seg_col]] == "Necrosis"] <- "Perinecrotic"
+  meta[[seg_col]][meta[[seg_col]] == "Vessel"]   <- "Perivascular"
+  
+  meta$Segment_clean <- factor(
+    meta[[seg_col]],
+    levels = c("Cellular tumor", "Perivascular", "Perinecrotic")
+  )
+  
+  return(meta)
+}
+
+# ============================================================
+# HELPER FUNCTION: NORMALIZE AND LOG2 TRANSFORM
+# ============================================================
+
+normalize_log_transform <- function(geomx_obj, assay_name = "log_q") {
+  
+  geomx_obj <- normalize(
+    geomx_obj,
+    norm_method = "quant",
+    desiredQuantile = 0.75,
+    toElt = "q_norm"
+  )
+  
+  log_q <- log2(assayDataElement(geomx_obj, "q_norm") + 1)
+  log_q[is.infinite(log_q)] <- NA
+  
+  assayDataElement(geomx_obj, assay_name) <- log_q
+  
+  return(geomx_obj)
+}
+
+# ============================================================
+# HELPER FUNCTION: RUN SEGMENT-SPECIFIC COX MODELS
+# ============================================================
+
+run_segment_cox <- function(
+    geomx_obj,
+    modality_label,
+    feature_label,
+    min_samples = 5,
+    assay_name = "log_q"
+) {
+  
+  message("\nRunning Cox models for: ", modality_label)
+  
+  # Normalize and log-transform
+  geomx_obj <- normalize_log_transform(geomx_obj, assay_name = assay_name)
+  
+  # Extract expression and metadata
+  log_expr <- assayDataElement(geomx_obj, assay_name)
+  meta <- as.data.frame(pData(geomx_obj))
+  
+  # Clean survival time
+  if (!"Overall_survival_months" %in% colnames(meta)) {
+    stop("Metadata must contain column: Overall_survival_months")
+  }
+  
+  meta$Overall_survival_months <- as.numeric(
+    trimws(as.character(meta$Overall_survival_months))
+  )
+  
+  # Clean segment labels
+  meta <- clean_segment_labels(meta)
+  
+  # Align metadata with expression matrix
+  meta <- meta[colnames(log_expr), , drop = FALSE]
+  
+  if (!identical(rownames(meta), colnames(log_expr))) {
+    stop("Metadata and expression matrix are not aligned for ", modality_label)
+  }
+  
+  cox_by_segment <- list()
+  
+  for (seg in segments) {
+    
+    message("  Segment: ", seg)
+    
+    idx <- which(meta$Segment_clean == seg)
+    
+    if (length(idx) == 0) {
+      message("    No samples for this segment; skipping.")
+      next
+    }
+    
+    seg_expr <- log_expr[, idx, drop = FALSE]
+    seg_time <- meta$Overall_survival_months[idx]
+    
+    # Assumes all patients experienced event.
+    # Replace this with real event status if available.
+    seg_status <- rep(1, length(seg_time))
+    
+    valid <- !is.na(seg_time)
+    
+    if (sum(valid) < min_samples) {
+      message("    Not enough valid samples; skipping.")
+      next
+    }
+    
+    surv_obj <- Surv(time = seg_time[valid], event = seg_status[valid])
+    seg_expr <- seg_expr[, valid, drop = FALSE]
+    
+    seg_results <- lapply(rownames(seg_expr), function(feature) {
+      
+      expr <- as.numeric(seg_expr[feature, ])
+      
+      if (all(is.na(expr))) return(NULL)
+      if (sd(expr, na.rm = TRUE) == 0) return(NULL)
+      if (length(unique(expr[!is.na(expr)])) < 5) return(NULL)
+      
+      model <- tryCatch(
+        coxph(surv_obj ~ expr),
+        error = function(e) NULL
+      )
+      
+      if (is.null(model)) return(NULL)
+      
+      s <- summary(model)
+      beta <- coef(model)[1]
+      HR <- exp(beta)
+      
+      data.frame(
+        Feature = feature,
+        beta = beta,
+        HR = HR,
+        p.value = s$coefficients[1, "Pr(>|z|)"],
+        z = s$coefficients[1, "z"],
+        Segment = seg,
+        Modality = modality_label,
+        stringsAsFactors = FALSE
+      )
+    })
+    
+    seg_results <- Filter(Negate(is.null), seg_results)
+    
+    if (length(seg_results) > 0) {
+      seg_df <- bind_rows(seg_results) %>%
+        mutate(
+          FDR = p.adjust(p.value, method = "BH"),
+          Feature_Label = feature_label
+        ) %>%
+        arrange(p.value)
+      
+      cox_by_segment[[seg]] <- seg_df
+    }
+  }
+  
+  all_cox <- bind_rows(cox_by_segment)
+  
+  return(all_cox)
+}
+
+# ============================================================
+# HELPER FUNCTION: PLOT TOP HAZARD RATIOS
+# ============================================================
+
+plot_top_cox <- function(
+    cox_df,
+    modality_label,
+    feature_label,
+    output_file,
+    top_n = 10,
+    p_cutoff = 0.05,
+    hr_min = 0.05,
+    hr_max = 20
+) {
+  
+  if (nrow(cox_df) == 0) {
+    message("No Cox results available for ", modality_label)
+    return(NULL)
+  }
+  
+  plot_df <- cox_df %>%
+    filter(
+      is.finite(HR),
+      HR > hr_min,
+      HR < hr_max,
+      p.value < p_cutoff
+    ) %>%
+    group_by(Segment) %>%
+    arrange(desc(HR), .by_group = TRUE) %>%
+    slice_head(n = top_n) %>%
+    ungroup() %>%
+    mutate(
+      Label = paste0(Feature, " (FDR=", signif(FDR, 2), ")")
+    )
+  
+  if (nrow(plot_df) == 0) {
+    message("No significant Cox results to plot for ", modality_label)
+    return(NULL)
+  }
+  
+  p <- ggplot(
+    plot_df,
+    aes(x = HR, y = forcats::fct_reorder(Label, HR), color = Segment)
+  ) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "gray40") +
+    geom_point(size = 3) +
+    facet_wrap(~Segment, scales = "free_y") +
+    scale_color_manual(values = segment_colors) +
+    theme_minimal(base_size = 11) +
+    labs(
+      title = paste0("Top Prognostic ", feature_label, "s by Segment: ", modality_label),
+      x = "Hazard Ratio",
+      y = feature_label
+    ) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "top",
+      axis.text.y = element_text(size = 8)
+    )
+  
+  ggsave(
+    filename = output_file,
+    plot = p,
+    width = 11,
+    height = 6,
+    dpi = 300,
+    bg = "white"
+  )
+  
+  return(p)
+}
+
+# ============================================================
+# RUN PROTEIN COX MODELS
+# ============================================================
+# Requires existing object: proteinData
+
+if (exists("proteinData")) {
+  
+  protein_cox <- run_segment_cox(
+    geomx_obj = proteinData,
+    modality_label = "Proteomics",
+    feature_label = "Protein",
+    min_samples = 5,
+    assay_name = "log_q"
+  )
+  
+  write.csv(
+    protein_cox,
+    file = file.path(path.expand(output_dir), "Protein_Cox_AllResults.csv"),
+    row.names = FALSE
+  )
+  
+  p_protein_cox <- plot_top_cox(
+    cox_df = protein_cox,
+    modality_label = "Proteomics",
+    feature_label = "Protein",
+    output_file = file.path(path.expand(output_dir), "Protein_Cox_TopHR_BySegment.png"),
+    top_n = 10
+  )
+}
+
+# ============================================================
+# RUN RNA COX MODELS
+# ============================================================
+# Requires existing object: target_demoData
+
+if (exists("target_demoData")) {
+  
+  rna_cox <- run_segment_cox(
+    geomx_obj = target_demoData,
+    modality_label = "Transcriptomics",
+    feature_label = "RNA",
+    min_samples = 5,
+    assay_name = "log_q"
+  )
+  
+  write.csv(
+    rna_cox,
+    file = file.path(path.expand(output_dir), "RNA_Cox_AllResults.csv"),
+    row.names = FALSE
+  )
+  
+  p_rna_cox <- plot_top_cox(
+    cox_df = rna_cox,
+    modality_label = "Transcriptomics",
+    feature_label = "RNA",
+    output_file = file.path(path.expand(output_dir), "RNA_Cox_TopHR_BySegment.png"),
+    top_n = 10
+  )
+}
+
+# ============================================================
+# OPTIONAL: COMBINE PROTEIN + RNA RESULTS
+# ============================================================
+
+if (exists("protein_cox") && exists("rna_cox")) {
+  
+  combined_cox <- bind_rows(protein_cox, rna_cox)
+  
+  write.csv(
+    combined_cox,
+    file = file.path(path.expand(output_dir), "Combined_Protein_RNA_Cox_AllResults.csv"),
+    row.names = FALSE
+  )
+}
+
+# ============================================================
+# END
+# ============================================================
+
