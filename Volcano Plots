@@ -1,0 +1,213 @@
+# ============================================================
+# GBM DSP Volcano Plot Analysis (Proteomics + Transcriptomics)
+# ============================================================
+
+# -------------------- Load Packages --------------------
+suppressPackageStartupMessages({
+  library(openxlsx)
+  library(ggplot2)
+  library(ggrepel)
+  library(dplyr)
+})
+
+# ============================================================
+# GLOBAL SETTINGS
+# ============================================================
+
+logFC_cutoff <- 1
+pval_cutoff  <- 0.05
+
+# ============================================================
+# HELPER FUNCTION: PROTEOMIC VOLCANO
+# ============================================================
+
+plot_proteomic_volcano <- function(df, title, xlim_range = c(-4, 4),
+                                   label_extreme = TRUE,
+                                   output_file = NULL) {
+  
+  df <- df %>%
+    mutate(
+      negLogP = -log10(Adjusted.pvalue),
+      Significance = case_when(
+        Adjusted.pvalue <= pval_cutoff & Log2 >= logFC_cutoff  ~ "Up",
+        Adjusted.pvalue <= pval_cutoff & Log2 <= -logFC_cutoff ~ "Down",
+        TRUE ~ "NS"
+      )
+    )
+  
+  p <- ggplot(df, aes(x = Log2, y = negLogP)) +
+    geom_point(aes(color = Significance), size = 2, alpha = 0.8) +
+    
+    scale_color_manual(values = c(
+      "Up" = "firebrick",
+      "Down" = "steelblue",
+      "NS" = "grey80"
+    )) +
+    
+    geom_vline(xintercept = c(-logFC_cutoff, logFC_cutoff),
+               linetype = "dashed") +
+    geom_hline(yintercept = -log10(pval_cutoff),
+               linetype = "dashed") +
+    
+    coord_cartesian(xlim = xlim_range) +
+    
+    theme_minimal() +
+    labs(
+      title = title,
+      x = "Log2 Fold Change",
+      y = "-log10(adjusted p-value)"
+    ) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      legend.position = "top"
+    )
+  
+  # Label extreme genes (optional)
+  if (label_extreme) {
+    label_df <- df %>%
+      filter(Adjusted.pvalue <= pval_cutoff & abs(Log2) >= logFC_cutoff)
+    
+    p <- p +
+      geom_text_repel(
+        data = label_df,
+        aes(label = Target.name),
+        size = 3,
+        max.overlaps = 25
+      )
+  }
+  
+  if (!is.null(output_file)) {
+    ggsave(output_file, plot = p, width = 8, height = 6)
+  }
+  
+  return(p)
+}
+
+# ============================================================
+# PROTEOMIC VOLCANO PLOTS (FROM EXCEL)
+# ============================================================
+
+protein_file <- "Volcano Plot_Protein.xlsx"
+
+necrosis_vessel <- read.xlsx(protein_file,
+                             sheet = "Necrosis vs Vessel",
+                             startRow = 7)
+
+necrosis_tumor <- read.xlsx(protein_file,
+                            sheet = "Necrosis vs Tumor",
+                            startRow = 7)
+
+vessel_tumor <- read.xlsx(protein_file,
+                          sheet = "Vessel vs Tumor",
+                          startRow = 7)
+
+p1 <- plot_proteomic_volcano(
+  necrosis_vessel,
+  "Proteomics: Necrosis vs Vessel",
+  xlim_range = c(-3, 3),
+  output_file = "volcano_protein_necrosis_vs_vessel.pdf"
+)
+
+p2 <- plot_proteomic_volcano(
+  necrosis_tumor,
+  "Proteomics: Necrosis vs Tumor",
+  xlim_range = c(-4, 3),
+  output_file = "volcano_protein_necrosis_vs_tumor.pdf"
+)
+
+p3 <- plot_proteomic_volcano(
+  vessel_tumor,
+  "Proteomics: Vessel vs Tumor",
+  xlim_range = c(-4, 3),
+  output_file = "volcano_protein_vessel_vs_tumor.pdf"
+)
+
+# ============================================================
+# TRANSCRIPTOMIC VOLCANO (limma-based)
+# ============================================================
+
+# NOTE: Requires:
+# - fit2 (limma model with contrasts applied)
+# - demoData (for gene mapping)
+
+if (exists("fit2") && exists("demoData")) {
+  
+  res <- topTable(
+    fit2,
+    coef = 1,
+    number = Inf,
+    sort.by = "none"
+  )
+  
+  res$RTS_ID <- rownames(res)
+  
+  # Map gene names
+  gene_map <- fData(demoData)[, c("RTS_ID", "TargetName")]
+  res <- merge(res, gene_map, by = "RTS_ID", all.x = TRUE)
+  
+  # Clean
+  res <- res %>%
+    filter(!is.na(TargetName), !is.na(logFC)) %>%
+    filter(!TargetName %in% c("PI3", "GFAP")) %>%
+    arrange(desc(abs(logFC))) %>%
+    distinct(TargetName, .keep_all = TRUE)
+  
+  # Compute metrics
+  res <- res %>%
+    mutate(
+      negLogP = -log10(P.Value),
+      Significance = case_when(
+        adj.P.Val < pval_cutoff & logFC > logFC_cutoff  ~ "Up",
+        adj.P.Val < pval_cutoff & logFC < -logFC_cutoff ~ "Down",
+        TRUE ~ "NS"
+      )
+    )
+  
+  # Select top genes for labeling
+  label_genes <- res %>%
+    arrange(adj.P.Val) %>%
+    head(10)
+  
+  p_rna <- ggplot(res, aes(x = logFC, y = negLogP)) +
+    
+    geom_point(aes(color = Significance), alpha = 0.7) +
+    
+    scale_color_manual(values = c(
+      "Up" = "firebrick",
+      "Down" = "steelblue",
+      "NS" = "grey80"
+    )) +
+    
+    geom_vline(xintercept = c(-logFC_cutoff, logFC_cutoff),
+               linetype = "dashed") +
+    geom_hline(yintercept = -log10(pval_cutoff),
+               linetype = "dashed") +
+    
+    geom_text_repel(
+      data = label_genes,
+      aes(label = TargetName),
+      size = 3,
+      max.overlaps = 20
+    ) +
+    
+    theme_minimal() +
+    labs(
+      title = "Transcriptomics: Perinecrotic vs Perivascular",
+      x = "Log2 Fold Change",
+      y = "-log10(p-value)"
+    ) +
+    theme(
+      legend.position = "top",
+      plot.title = element_text(face = "bold")
+    )
+  
+  ggsave(
+    "volcano_rna_perinecrotic_vs_perivascular.pdf",
+    plot = p_rna,
+    width = 8,
+    height = 6
+  )
+}
+
+# ===========================================================
+
